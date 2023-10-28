@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use tokio::fs;
 
 fn default_as_true() -> bool {

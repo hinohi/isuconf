@@ -3,7 +3,8 @@ use crate::config::{RemoteConfig, TargetConfig};
 use anyhow::{anyhow, Context, Result};
 use chrono::Local;
 use itertools::Itertools;
-use openssh::{KnownHosts, Session, SessionBuilder};
+use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
+use openssh_sftp_client::{file::TokioCompatFile, Sftp};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -151,9 +152,7 @@ impl RemoteConfigClient {
         relative_path: &Path,
     ) -> Result<Vec<u8>> {
         let path = self.real_path(server_name, target, relative_path)?;
-        let session = self.remote_session(server_name).await?;
-        let mut config = vec![];
-
+        let mut buf = Vec::new();
         if target.sudo {
             let tmp_path = format!("/tmp/{}", Local::now().to_rfc3339());
 
@@ -167,9 +166,8 @@ impl RemoteConfigClient {
             self.remote_command(server_name, &format!("chmod 644 {}", tmp_path), true)
                 .await?;
 
-            let mut remote_file = session.sftp().read_from(&tmp_path).await?;
-            remote_file.read_to_end(&mut config).await?;
-            remote_file.close().await?;
+            self.read_remote_file_to_end(server_name, &tmp_path, &mut buf)
+                .await?;
 
             self.remote_command(server_name, &format!("rm {}", tmp_path), true)
                 .await?;
@@ -178,12 +176,36 @@ impl RemoteConfigClient {
             if path.starts_with('~') {
                 path = path.replacen('~', format!("/home/{}", self.config.user).as_str(), 1);
             }
-            let mut remote_file = session.sftp().read_from(&path).await?;
-            remote_file.read_to_end(&mut config).await?;
-            remote_file.close().await?;
+            self.read_remote_file_to_end(server_name, &path, &mut buf)
+                .await?;
         }
 
-        Ok(config)
+        Ok(buf)
+    }
+
+    async fn read_remote_file_to_end<P: AsRef<Path>>(
+        &self,
+        server_name: &str,
+        path: P,
+        buf: &mut Vec<u8>,
+    ) -> Result<usize> {
+        let session = self.remote_session(server_name).await?;
+        let mut child = session
+            .subsystem("sftp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .await?;
+        let sftp = Sftp::new(
+            child.stdin().take().unwrap(),
+            child.stdout().take().unwrap(),
+            Default::default(),
+        )
+        .await?;
+        let mut file = TokioCompatFile::new(sftp.open(path.as_ref()).await?);
+        let c = file.read_to_end(buf).await?;
+        sftp.close().await?;
+        Ok(c)
     }
 
     pub async fn create(
