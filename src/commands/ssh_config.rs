@@ -1,5 +1,4 @@
-
-use crate::config::{read_config};
+use crate::config::read_config;
 use anyhow::Result;
 use structopt::StructOpt;
 

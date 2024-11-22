@@ -1,23 +1,26 @@
 use crate::client::{convert_to_string, join_path};
 use crate::config::{RemoteConfig, TargetConfig};
 use anyhow::{anyhow, Context, Result};
+use bytes::BytesMut;
 use chrono::Local;
 use itertools::Itertools;
 use openssh::{KnownHosts, Session, SessionBuilder};
+use openssh_sftp_client::Sftp;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 pub struct RemoteConfigClient {
     config: RemoteConfig,
     sessions: HashMap<String, Session>,
+    sftp_clients: HashMap<String, Sftp>,
 }
 
 impl RemoteConfigClient {
     pub async fn new(config: &RemoteConfig) -> Result<Self> {
         let mut sessions = HashMap::new();
+        let mut sftp_clients = HashMap::new();
 
         for server in &config.servers {
             let mut builder = SessionBuilder::default();
@@ -32,24 +35,43 @@ impl RemoteConfigClient {
             )
             .await
             .map_err(|_| anyhow!("Timeout connect to {}@{}", config.user, server.host))??;
-
             sessions.insert(server.name(), session);
+
+            let session = timeout(
+                Duration::from_secs(config.timeout.unwrap_or(5)),
+                builder.connect(format!("ssh://{}@{}", config.user, server.host)),
+            )
+            .await
+            .map_err(|_| anyhow!("Timeout connect to {}@{}", config.user, server.host))??;
+            sftp_clients.insert(
+                server.name(),
+                Sftp::from_session(session, Default::default()).await?,
+            );
         }
 
         let client = RemoteConfigClient {
             config: config.clone(),
             sessions,
+            sftp_clients,
         };
 
         Ok(client)
     }
 
-    async fn remote_session(&self, server_name: &str) -> Result<&Session> {
+    fn remote_session(&self, server_name: &str) -> Result<&Session> {
         let session = self
             .sessions
             .get(server_name)
             .with_context(|| format!("Not found connection. (server={})", &server_name))?;
         Ok(session)
+    }
+
+    fn sftp_client(&self, server_name: &str) -> Result<&Sftp> {
+        let sftp = self
+            .sftp_clients
+            .get(server_name)
+            .with_context(|| format!("Not found connection. (server={})", &server_name))?;
+        Ok(sftp)
     }
 
     async fn remote_command(&self, server_name: &str, command: &str, sudo: bool) -> Result<String> {
@@ -59,8 +81,7 @@ impl RemoteConfigClient {
         }
 
         let output = self
-            .remote_session(server_name)
-            .await?
+            .remote_session(server_name)?
             .raw_command(&command)
             .output()
             .await?;
@@ -163,6 +184,18 @@ impl RemoteConfigClient {
             .map_err(|_| anyhow!("Failed to parse stat result."))
     }
 
+    async fn read_remote_path(&self, server_name: &str, path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let sftp = self.sftp_client(server_name)?;
+        // これ本当か？？？と思っている
+        let mut remote_file = sftp.open(path).await?;
+        let metadata = remote_file.metadata().await?;
+        let buffer = remote_file
+            .read_all(metadata.len().unwrap() as usize, BytesMut::new())
+            .await?;
+        remote_file.close().await?;
+        Ok(buffer.to_vec())
+    }
+
     pub async fn get(
         &self,
         server_name: &str,
@@ -170,10 +203,7 @@ impl RemoteConfigClient {
         relative_path: &Path,
     ) -> Result<Vec<u8>> {
         let path = self.real_path(server_name, target, relative_path)?;
-        let session = self.remote_session(server_name).await?;
-        let mut config = vec![];
-
-        if target.sudo {
+        let config = if target.sudo {
             let tmp_path = format!("/tmp/{}", Local::now().to_rfc3339());
 
             self.remote_command(
@@ -185,22 +215,17 @@ impl RemoteConfigClient {
 
             self.remote_command(server_name, &format!("chmod 644 {}", tmp_path), true)
                 .await?;
-
-            let mut remote_file = session.sftp().read_from(&tmp_path).await?;
-            remote_file.read_to_end(&mut config).await?;
-            remote_file.close().await?;
-
+            let config = self.read_remote_path(server_name, &tmp_path).await?;
             self.remote_command(server_name, &format!("rm {}", tmp_path), true)
                 .await?;
+            config
         } else {
             let mut path = convert_to_string(&path)?;
             if path.starts_with('~') {
                 path = path.replacen('~', format!("/home/{}", self.config.user).as_str(), 1);
             }
-            let mut remote_file = session.sftp().read_from(&path).await?;
-            remote_file.read_to_end(&mut config).await?;
-            remote_file.close().await?;
-        }
+            self.read_remote_path(server_name, &path).await?
+        };
 
         Ok(config)
     }
@@ -213,11 +238,11 @@ impl RemoteConfigClient {
         config_bytes: Vec<u8>,
     ) -> Result<()> {
         let path = self.real_path(server_name, target, relative_path)?;
-        let session = self.remote_session(server_name).await?;
+        let sftp = self.sftp_client(server_name)?;
 
         if target.sudo {
             let tmp_path = format!("/tmp/{}", Local::now().to_rfc3339());
-            let mut remote_file = session.sftp().write_to(&tmp_path).await?;
+            let mut remote_file = sftp.create(&tmp_path).await?;
             remote_file.write_all(&config_bytes).await?;
             remote_file.close().await?;
 
@@ -255,7 +280,7 @@ impl RemoteConfigClient {
                 .await?;
             }
 
-            let mut remote_file = session.sftp().write_to(path).await?;
+            let mut remote_file = sftp.create(path).await?;
             remote_file.write_all(&config_bytes).await?;
             remote_file.close().await?;
         }
